@@ -44,7 +44,8 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    shutdown_wait = ?TIMEOUT ::non_neg_integer() | infinity
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -104,13 +105,14 @@ child_spec(PoolId, PoolArgs, WorkerArgs) ->
                  ChildSpecFormat :: 'tuple' | 'map')
     -> supervisor:child_spec().
 child_spec(PoolId, PoolArgs, WorkerArgs, tuple) ->
+    ShutdownWait = proplists:get_value(shutdown_wait, PoolArgs, ?TIMEOUT),
     {PoolId, {poolboy, start_link, [PoolArgs, WorkerArgs]},
-     permanent, 5000, worker, [poolboy]};
+     permanent, ShutdownWait, worker, [poolboy]};
 child_spec(PoolId, PoolArgs, WorkerArgs, map) ->
     #{id => PoolId,
       start => {poolboy, start_link, [PoolArgs, WorkerArgs]},
       restart => permanent,
-      shutdown => 5000,
+      shutdown => proplists:get_value(shutdown_wait, PoolArgs, ?TIMEOUT),
       type => worker,
       modules => [poolboy]}.
 
@@ -152,7 +154,8 @@ init({PoolArgs, WorkerArgs}) ->
     init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
 
 init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
-    {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
+    ShutdownWait = proplists:get_value(shutdown_wait, Rest, State#state.shutdown_wait),
+    {ok, Sup} = poolboy_sup:start_link(Mod, ShutdownWait, WorkerArgs),
     init(Rest, WorkerArgs, State#state{supervisor = Sup});
 init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
     init(Rest, WorkerArgs, State#state{size = Size});
@@ -162,6 +165,8 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{shutdown_wait, Wait} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State#state{shutdown_wait = Wait});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
@@ -279,11 +284,15 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, State) ->
-    Workers = queue:to_list(State#state.workers),
-    ok = lists:foreach(fun (W) -> unlink(W) end, Workers),
-    true = exit(State#state.supervisor, shutdown),
-    ok.
+terminate(_Reason, #state{supervisor = Sup, workers = Workers, shutdown_wait = ShutdownWait}) ->
+    ok = lists:foreach(fun (W) -> unlink(W) end, queue:to_list(Workers)),
+    true = exit(Sup, shutdown),
+    receive
+        {'EXIT', Sup, _} ->
+            ok
+        after ShutdownWait ->
+            ok
+    end.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
